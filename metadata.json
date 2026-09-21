@@ -1,0 +1,6 @@
+{
+  "name": "Nova Assistant",
+  "description": "Advanced Nova AI voice assistant with physical power button integration, OLED Always-On Display, ambient aura gesture bar, Gemini voice conversation, and native hardware controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
