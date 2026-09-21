@@ -1,0 +1,199 @@
+name: Build & Release Android Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish APK to GitHub Releases'
+        required: false
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Custom Release Tag (e.g. v1.0.0). Leave empty for auto-generated tag'
+        required: false
+        type: string
+        default: ''
+      release_title:
+        description: 'Release Title (e.g. Nova Assistant v1.0 Debug Build)'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare Debug Keystore
+        run: |
+          echo "Checking debug keystore..."
+          if [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "Successfully decoded debug.keystore from base64"
+          elif [ ! -f "debug.keystore" ]; then
+            keytool -genkey -v -keystore debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+            echo "Generated fallback debug.keystore"
+          fi
+
+      - name: Configure Secrets & Environment
+        run: |
+          # Use repository secret if available, otherwise fallback to .env.example
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" > .env
+            echo "Configured GEMINI_API_KEY from GitHub Secrets"
+          elif [ -f ".env.example" ]; then
+            cp .env.example .env
+            echo "Used .env.example template for build configuration"
+          else
+            touch .env
+          fi
+
+      - name: Grant Execute Permission for Gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK with Gradle
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Prepare APK Output Artifacts
+        id: prepare_apk
+        run: |
+          APK_DIR="app/build/outputs/apk/debug"
+          mkdir -p release_artifacts
+          
+          # Copy standard APK
+          cp "$APK_DIR/app-debug.apk" release_artifacts/app-debug.apk
+          
+          # Friendly named APK with version and build number
+          VERSION="1.0"
+          BUILD_NUM="${{ github.run_number }}"
+          FRIENDLY_NAME="NovaAssistant-v${VERSION}-debug-b${BUILD_NUM}.apk"
+          cp "$APK_DIR/app-debug.apk" "release_artifacts/$FRIENDLY_NAME"
+          
+          # Compute SHA-256 checksum
+          cd release_artifacts
+          sha256sum "$FRIENDLY_NAME" > "${FRIENDLY_NAME}.sha256"
+          cd ..
+          
+          echo "friendly_name=$FRIENDLY_NAME" >> "$GITHUB_OUTPUT"
+          echo "apk_path=release_artifacts/$FRIENDLY_NAME" >> "$GITHUB_OUTPUT"
+          ls -la release_artifacts
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NovaAssistant-Debug-APK-b${{ github.run_number }}
+          path: release_artifacts/
+          retention-days: 30
+
+      - name: Determine Release Information
+        id: release_info
+        if: github.event_name != 'pull_request'
+        run: |
+          # Determine if release should be created
+          SHOULD_RELEASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.create_release }}" == "true" ]; then
+              SHOULD_RELEASE=true
+            fi
+          elif [ "${{ startsWith(github.ref, 'refs/tags/v') }}" == "true" ]; then
+            SHOULD_RELEASE=true
+          elif [ "${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}" == "true" ]; then
+            SHOULD_RELEASE=true
+          fi
+          
+          # Determine tag name
+          TAG_NAME="${{ github.event.inputs.release_tag }}"
+          if [ -z "$TAG_NAME" ]; then
+            if [ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]; then
+              TAG_NAME="${GITHUB_REF#refs/tags/}"
+            else
+              TAG_NAME="v1.0.${{ github.run_number }}-debug"
+            fi
+          fi
+          
+          # Determine release title
+          RELEASE_TITLE="${{ github.event.inputs.release_title }}"
+          if [ -z "$RELEASE_TITLE" ]; then
+            RELEASE_TITLE="Nova Assistant Debug Build #${{ github.run_number }} ($TAG_NAME)"
+          fi
+          
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "release_title=$RELEASE_TITLE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to GitHub Releases
+        if: steps.release_info.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ${{ steps.release_info.outputs.release_title }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: |
+            release_artifacts/*.apk
+            release_artifacts/*.sha256
+          body: |
+            ### 🤖 Nova AI Assistant — Android Debug APK
+            
+            **Direct Download:**
+            - 📲 **[Download ${{ steps.prepare_apk.outputs.friendly_name }}](https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.tag_name }}/${{ steps.prepare_apk.outputs.friendly_name }})**
+            - 📦 Standard filename: `app-debug.apk`
+            
+            ---
+            
+            #### 📋 Build Details:
+            - **App Version:** `1.0` (VersionCode: `1`)
+            - **Target SDK:** Android 16 (API 36)
+            - **Min SDK:** Android 7.0 (API 24)
+            - **Commit SHA:** `${{ github.sha }}`
+            - **Run Number:** `${{ github.run_number }}`
+            - **Signed With:** Android Debug Certificate
+            
+            ---
+            
+            #### 💡 Installation Instructions:
+            1. Download the `.apk` file above onto your Android device.
+            2. Open the file and allow *"Install from Unknown Sources"* if prompted.
+            3. Enjoy full conversational voice, device controls, and Google Gemini Settings!
